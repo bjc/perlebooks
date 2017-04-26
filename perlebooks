@@ -1,0 +1,190 @@
+#!/usr/bin/env perl
+
+use strict;
+use warnings;
+use utf8;
+
+use Cwd qw(abs_path);
+use Encode qw(decode encode);
+use File::Basename;
+use HTML::Entities;
+use IO::File;
+use Net::Twitter::Lite::WithAPIv1_1;
+use Scalar::Util qw(blessed);
+use YAML;
+
+binmode(STDIN, ':utf8');
+binmode(STDOUT, ':utf8');
+binmode(STDERR, ':utf8');
+
+my $dir = dirname(abs_path($0));
+my $CONFFILE = "$dir/conf.yaml";
+my $LASTIDFILE = "$dir/lastid";
+my $CORPUSFILE = "$dir/corpus";
+my $BATCHCOUNT = 200;
+my $MAXLEN = 140;
+
+my %conf = %{YAML::LoadFile($CONFFILE)};
+
+my $nt = login($conf{access_secret},
+	       $conf{access_token},
+	       $conf{consumer_secret},
+	       $conf{consumer_key});
+my $lastid = lastid($LASTIDFILE);
+$lastid = read_tl($nt, $conf{user}, $lastid, $BATCHCOUNT, $CORPUSFILE);
+updatelastid($LASTIDFILE, $lastid) if $lastid;
+
+my $tweet = gettweet($CORPUSFILE);
+utf8::upgrade($tweet);
+#print "$tweet\n";
+$nt->update($tweet);
+
+sub login {
+  my ($access_secret, $access_token, $consumer_secret, $consumer_key) = @_;
+
+  Net::Twitter::Lite::WithAPIv1_1->new(access_token_secret => $access_secret,
+                                       access_token        => $access_token,
+                                       consumer_secret     => $consumer_secret,
+                                       consumer_key        => $consumer_key,
+                                       ssl                 => 1) || die "Couldn't log in to twitter: $@.\n";
+}
+
+sub lastid {
+  my $fn = shift;
+
+  my $id;
+  my $fh = IO::File->new($fn, 'r');
+  if ($fh) {
+    $id = <$fh>;
+    chomp $id;
+  }
+
+  $id;
+}
+
+# TODO: Make atomic.
+sub updatelastid {
+  my ($fn, $id) = @_;
+
+  my $fh = IO::File->new($fn, 'w') || die "Couldn't open $fn for writing: $!.\n";
+  print $fh "$id\n";
+}
+
+sub read_tl {
+  my ($nt, $user, $id, $count, $corpusfn) = @_;
+
+  my $fh = IO::File->new($corpusfn, 'a') || die "Couldn't open $corpusfn for appending: $!.\n";
+  binmode($fh, ':utf8');
+
+  my $rc = eval {
+    my $params = {screen_name     => $user,
+                  count           => $count,
+                  exclude_replies => 1,
+                  trim_user       => 1,
+                  include_rts     => 0};
+    $params->{since_id} = $id if $id;
+
+    my $latestid;
+    while ((my @statuses = @{$nt->user_timeline($params)}) > 0) {
+      foreach my $status (@statuses) {
+        $status->{text} = escape($status->{text});
+        print $fh "$status->{id}\t$status->{created_at}\t$status->{text}\n";
+      }
+      $params->{max_id} = $statuses[$#statuses]->{id} - 1;
+      $latestid = $statuses[0]->{id} unless $latestid;
+    }
+    $latestid;
+  };
+
+  if (my $err = $@) {
+    die $@ unless blessed $err && $err->isa('Net::Twitter::Lite::Error');
+
+    print STDERR $err->twitter_error->{errors}->[0]->{code} . ": " .
+      $err->twitter_error->{errors}->[0]->{message} . "\n";
+  }
+
+  return $rc;
+}
+
+sub gettweet {
+  my $fn = shift;
+
+  my $fh = IO::File->new($fn, 'r') || die "Couldn't open $fn for reading: $!.\n";
+  binmode($fh, ':utf8');
+
+  my %dict;
+  while (<$fh>) {
+    my ($id, $date, $text) = split /\t/;
+
+    $text = unescape($text);
+
+    my @toks = split /\s+/, $text;
+    for (my $i = 1; $i <= $#toks; $i++) {
+      my %children = %{$dict{$toks[$i - 1]} || {}};
+      $children{$toks[$i]} = ($children{$toks[$i]} || 0) + 1;
+      $dict{$toks[$i - 1]} = \%children;
+    }
+  }
+
+  return genchain($MAXLEN, %dict);
+}
+
+sub genchain {
+  my ($len, %dict) = @_;
+
+  my $chain;
+
+  my @words = keys %dict;
+  my $word = @words[rand(@words)];
+
+  do {
+    $chain .= ' ' if $chain;
+    $chain .= $word;
+
+    $word = nextword($word, %dict);
+    return $chain if defined($word) && length("$chain $word") > $MAXLEN;
+  } until !defined($word);
+
+  return $chain;
+}
+
+sub nextword {
+  my ($word, %dict) = @_;
+
+  my %choices = %{$dict{$word} || {}};
+
+  my @choicearr = map { [$_, $choices{$_}] } keys %choices;
+  my @sorted = sort { $b->[1] <=> $a->[1] } @choicearr;
+
+  my $total = 0;
+  foreach my $count (values %choices) {
+    $total += $count;
+  }
+
+  my $nextind = rand $total;
+  foreach my $choice (@choicearr) {
+    $nextind -= $choice->[1];
+    return $choice->[0] unless $nextind > 0;
+  }
+}
+
+sub escape {
+  my $str = shift;
+
+  # HTML decoding is one-way, thanks twitter.
+  $str = decode_entities($str);
+
+  $str =~ s/\\/\\\\/g;
+  $str =~ s/\n/\\n/g;
+  $str =~ s/\t/\\t/g;
+  $str
+}
+
+sub unescape {
+  my $str = shift;
+
+  $str =~ s/\\n/\n/g;
+  $str =~ s/\\t/\t/g;
+  $str =~ s/\\\\/\\/g;
+  $str;
+}

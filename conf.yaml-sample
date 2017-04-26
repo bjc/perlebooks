@@ -1,0 +1,6 @@
+---
+  user: 'SomeTwitterUser'
+  access_secret: 'YourAccessSecret'
+  access_token: 'YourAccessToken'
+  consumer_key: 'YourConsumerKey'
+  consumer_secret: 'YourConsumerSecret'
